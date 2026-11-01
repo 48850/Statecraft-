@@ -1,0 +1,9 @@
+{
+  "name": "statecraft",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Global Politics revision game with AI-marked answers",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
