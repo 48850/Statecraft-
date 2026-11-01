@@ -421,9 +421,9 @@ const verdict = s => s >= .5 ? ['Strong answer', 'good'] : s >= .25 ? ['Partly t
 /* ---------- answer judge ---------- */
 let SAMPLE = null, aiNote = '';
 /* ---------- AI judge for the website: answers go to the Statecraft judge server, which holds the key ---------- */
-const JUDGE_URL = '';
+const JUDGE_URL = '' || (/github\.io$/.test(location.hostname) || location.protocol === 'file:' ? '' : '/api/judge');
 try { localStorage.removeItem('statecraft-ai-key'); } catch(e){}
-SAMPLE = /^https:\/\//.test(JUDGE_URL) ? { judgeCard: async (card, typed) => {
+SAMPLE = JUDGE_URL ? { judgeCard: async (card, typed) => {
   let r;
   try { r = await fetch(JUDGE_URL, {method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({topic: DECKS[card.d].name, q: card.q, a: card.a, answer: typed.slice(0, 1500)})}); }

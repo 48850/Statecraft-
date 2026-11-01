@@ -15,3 +15,6 @@ Play it: https://48850.github.io/Statecraft-/
 Progress saves in your browser. No sign-up, no tracking.
 
 Made by Elliot Thevathasan.
+
+## AI marking
+Typed answers are marked by `api/judge.js`, a serverless function. Deploy the repo on Vercel and set the `ANTHROPIC_API_KEY` environment variable there. The key is never stored in this repo or sent to the browser. Without it, answers fall back to keyword marking.
