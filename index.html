@@ -431,10 +431,11 @@ function makeJudge(){
       let r;
       try {
         r = await fetch(API, {method:'POST', headers:{'content-type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true'},
-          body: JSON.stringify({model:MODELS[modelIx], max_tokens:500, temperature:0, messages:[{role:'user', content:prompt}]})});
+          body: JSON.stringify({model:MODELS[modelIx], max_tokens:500, messages:[{role:'user', content:prompt}]})});
       } catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
-      if (r.status === 404 && modelIx < MODELS.length - 1){ modelIx++; continue; }
-      if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = (r.status === 401 || r.status === 403) ? 'bad_key' : (r.status === 429 || r.status === 529) ? 'rate_limited' : 'upstream_error'; throw x; }
+      if (!r.ok){ const eb = await r.json().catch(() => ({})), detail = (eb.error && eb.error.message) || '';
+        if ((r.status === 404 || (r.status === 400 && /model/i.test(detail))) && modelIx < MODELS.length - 1){ modelIx++; continue; }
+        const x = new Error('HTTP ' + r.status); x.detail = 'Error ' + r.status + (detail ? ': ' + detail : ''); x.code = (r.status === 401 || r.status === 403) ? 'bad_key' : (r.status === 429 || r.status === 529) ? 'rate_limited' : 'upstream_error'; throw x; }
       const d = await r.json(), t = (d.content || []).map(c => c.text || '').join(''), m = t.match(/\{[\s\S]*\}/);
       if (!m){ const x = new Error('no json'); x.code = 'upstream_error'; throw x; }
       return JSON.parse(m[0]);
@@ -477,7 +478,8 @@ function aiPanel(){
       try { localStorage.setItem(AIKEY, k); } catch(e){}
       SAMPLE = t; S.ai = true; save(); msg('Key works. The AI judge is on.', 'good'); paintBar(); setTimeout(close, 1100);
     } catch(e){ apiKey = prev; SAMPLE = makeJudge();
-      msg(e.code === 'bad_key' ? 'That key was rejected. Check you copied all of it.' : e.code === 'rate_limited' ? 'The key works but the AI is busy. Try again in a minute.' : 'Could not reach the AI. Check your connection, or that the account has credit.', 'bad'); }
+      msg(e.code === 'bad_key' ? 'That key was rejected. Check you copied all of it.' : e.code === 'rate_limited' ? 'The key works but the AI is busy. Try again in a minute.' : (e.detail && /credit|billing|balance/i.test(e.detail) ? 'The account has no credit. Add some under Billing, then try again.' : 'Could not reach the AI. Check your connection, or that the account has credit.'), 'bad');
+      if (e.detail){ const d = document.createElement('small'); d.className = 'aipdet'; d.textContent = 'Details: ' + e.detail; document.getElementById('aimsg').appendChild(d); } }
   };
   const tg = document.getElementById('aitoggle'); if (tg) tg.onclick = () => { S.ai = S.ai === false; save(); aiPanel(); };
   const dl = document.getElementById('aidel'); if (dl) dl.onclick = () => { try { localStorage.removeItem(AIKEY); } catch(e){} apiKey = ''; SAMPLE = null; aiPanel(); };
@@ -491,7 +493,7 @@ aiCss.textContent = `.aip{position:fixed;inset:0;z-index:50;background:rgba(5,5,
 .aipbox label{display:block;font-weight:700;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:6px 0 6px}
 .aipbox input{width:100%;box-sizing:border-box;background:var(--panel-2);border:1.5px solid var(--line);border-radius:12px;padding:12px 14px;color:var(--ink);font:inherit;font-size:16px}
 .aipbox input:focus{outline:none;border-color:var(--gold)}.aipbox code{color:var(--ink)}
-.aipmsg{min-height:22px;margin:8px 0;font-size:14.5px;color:var(--ink-2)}.aipmsg.good{color:var(--good)}.aipmsg.bad{color:var(--bad)}
+.aipmsg{min-height:22px;margin:8px 0;font-size:14.5px;color:var(--ink-2)}.aipmsg.good{color:var(--good)}.aipmsg.bad{color:var(--bad)}.aipdet{display:block;margin-top:6px;color:var(--ink-3);font-size:12.5px;word-break:break-word}
 .aipbox .row{flex-wrap:wrap;justify-content:flex-start}.aipfine{font-size:13px!important;color:var(--ink-3)!important;margin-top:14px!important}.aipfine a{color:var(--xp)}`;
 document.head.appendChild(aiCss);
 const aiReady = () => !!SAMPLE && S.ai !== false;
