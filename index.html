@@ -420,6 +420,80 @@ const verdict = s => s >= .5 ? ['Strong answer', 'good'] : s >= .25 ? ['Partly t
 
 /* ---------- answer judge ---------- */
 let SAMPLE = null, aiNote = '';
+/* ---------- AI judge for the website: uses your own API key, stored only in this browser ---------- */
+const AIKEY = 'statecraft-ai-key', API = 'https://api.anthropic.com/v1/messages', MODELS = ['claude-haiku-5-5', 'claude-haiku-4-5'];
+let apiKey = ''; try { apiKey = localStorage.getItem(AIKEY) || ''; } catch(e){}
+let modelIx = 0;
+function makeJudge(){
+  if (!apiKey) return null;
+  return { json: async (prompt) => {
+    for (;;){
+      let r;
+      try {
+        r = await fetch(API, {method:'POST', headers:{'content-type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01', 'anthropic-dangerous-direct-browser-access':'true'},
+          body: JSON.stringify({model:MODELS[modelIx], max_tokens:500, temperature:0, messages:[{role:'user', content:prompt}]})});
+      } catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
+      if (r.status === 404 && modelIx < MODELS.length - 1){ modelIx++; continue; }
+      if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = (r.status === 401 || r.status === 403) ? 'bad_key' : (r.status === 429 || r.status === 529) ? 'rate_limited' : 'upstream_error'; throw x; }
+      const d = await r.json(), t = (d.content || []).map(c => c.text || '').join(''), m = t.match(/\{[\s\S]*\}/);
+      if (!m){ const x = new Error('no json'); x.code = 'upstream_error'; throw x; }
+      return JSON.parse(m[0]);
+    }
+  }};
+}
+SAMPLE = makeJudge();
+const _paintBar = paintBar;
+paintBar = function(){ _paintBar(); const at = document.getElementById('aitog'); if (!at) return; at.hidden = false;
+  at.textContent = !apiKey ? 'Set up AI judge' : S.ai === false ? 'AI judge off' : 'AI judge on'; };
+function aiPanel(){
+  const old = document.getElementById('aipanel'); if (old) old.remove();
+  const w = document.createElement('div'); w.id = 'aipanel'; w.className = 'aip';
+  const masked = apiKey ? apiKey.slice(0, 10) + '…' + apiKey.slice(-4) : '';
+  w.innerHTML = `<div class="aipbox" role="dialog" aria-modal="true" aria-labelledby="aipt">
+    <h3 id="aipt">AI judge</h3>
+    <p>The AI judge reads your typed answers and tells you what you got right, what to fix and what you missed. On this website it runs on your own API key, which costs well under a cent per answer.</p>
+    ${apiKey ? `<p class="aipst">Key saved: <code>${esc(masked)}</code> · AI judge is <b>${S.ai === false ? 'off' : 'on'}</b></p>` : ''}
+    <label for="aikey">${apiKey ? 'Replace key' : 'Paste your API key'}</label>
+    <input id="aikey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
+    <div class="aipmsg" id="aimsg"></div>
+    <div class="row">
+      <button type="button" class="btn gold" id="aisave">Save and test</button>
+      ${apiKey ? `<button type="button" class="btn" id="aitoggle">${S.ai === false ? 'Turn on' : 'Turn off'}</button><button type="button" class="btn bad" id="aidel">Remove key</button>` : ''}
+      <button type="button" class="btn" id="aiclose">Close</button>
+    </div>
+    <p class="aipfine">Your key is saved only in this browser and is sent only to the AI provider when an answer is marked. Anyone using this browser can use it, so don't save it on a shared computer. <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Get a key</a> and set a monthly spend limit on that account.</p>
+  </div>`;
+  document.body.appendChild(w);
+  const close = () => { w.remove(); paintBar(); };
+  w.onclick = e => { if (e.target === w) close(); };
+  w.onkeydown = e => { if (e.key === 'Escape') close(); };
+  document.getElementById('aiclose').onclick = close;
+  const msg = (t, c) => { const m = document.getElementById('aimsg'); m.textContent = t; m.className = 'aipmsg ' + (c || ''); };
+  document.getElementById('aisave').onclick = async () => {
+    const k = document.getElementById('aikey').value.trim() || apiKey;
+    if (!k){ msg('Paste a key first.', 'bad'); return; }
+    msg('Testing the key…'); const prev = apiKey; apiKey = k; modelIx = 0; const t = makeJudge();
+    try { await t.json('Reply with only this JSON: {"ok": true}');
+      try { localStorage.setItem(AIKEY, k); } catch(e){}
+      SAMPLE = t; S.ai = true; save(); msg('Key works. The AI judge is on.', 'good'); paintBar(); setTimeout(close, 1100);
+    } catch(e){ apiKey = prev; SAMPLE = makeJudge();
+      msg(e.code === 'bad_key' ? 'That key was rejected. Check you copied all of it.' : e.code === 'rate_limited' ? 'The key works but the AI is busy. Try again in a minute.' : 'Could not reach the AI. Check your connection, or that the account has credit.', 'bad'); }
+  };
+  const tg = document.getElementById('aitoggle'); if (tg) tg.onclick = () => { S.ai = S.ai === false; save(); aiPanel(); };
+  const dl = document.getElementById('aidel'); if (dl) dl.onclick = () => { try { localStorage.removeItem(AIKEY); } catch(e){} apiKey = ''; SAMPLE = null; aiPanel(); };
+  setTimeout(() => document.getElementById('aikey').focus(), 30);
+}
+setTimeout(() => { document.getElementById('aitog').onclick = aiPanel; paintBar(); });
+const aiCss = document.createElement('style');
+aiCss.textContent = `.aip{position:fixed;inset:0;z-index:50;background:rgba(5,5,15,.72);display:grid;place-items:center;padding:16px}
+.aipbox{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:22px;max-width:520px;width:100%;max-height:calc(100vh - 32px);overflow:auto}
+.aipbox h3{font-family:var(--f-display);font-size:24px;margin:0 0 8px}.aipbox p{color:var(--ink-2);margin:0 0 12px;font-size:15.5px}
+.aipbox label{display:block;font-weight:700;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);margin:6px 0 6px}
+.aipbox input{width:100%;box-sizing:border-box;background:var(--panel-2);border:1.5px solid var(--line);border-radius:12px;padding:12px 14px;color:var(--ink);font:inherit;font-size:16px}
+.aipbox input:focus{outline:none;border-color:var(--gold)}.aipbox code{color:var(--ink)}
+.aipmsg{min-height:22px;margin:8px 0;font-size:14.5px;color:var(--ink-2)}.aipmsg.good{color:var(--good)}.aipmsg.bad{color:var(--bad)}
+.aipbox .row{flex-wrap:wrap;justify-content:flex-start}.aipfine{font-size:13px!important;color:var(--ink-3)!important;margin-top:14px!important}.aipfine a{color:var(--xp)}`;
+document.head.appendChild(aiCss);
 const aiReady = () => !!SAMPLE && S.ai !== false;
 function judgePrompt(card, typed){
   return `You are a fair but strict examiner marking one flashcard answer for a Year 10 Global Politics student in Australia.
@@ -455,7 +529,7 @@ async function judge(card, typed){
       return {score, verdict:v, right:String((r && (r.right ?? r.feedback)) || '').slice(0, 300), improve:String((r && r.improve) || '').slice(0, 300), missing:Array.isArray(r && r.missing) ? r.missing.slice(0,3).map(x => String(x).slice(0,120)) : [], kw, ai:true};
     } catch(e){
       if (['not_granted','sampling_disabled','not_declared','capability_disabled','capability_removed','session_expired'].includes(e && e.code)){ SAMPLE = null; paintBar(); aiNote = 'The AI judge is not available here, so this was marked by keyword check.'; }
-      else aiNote = (e && e.code) === 'rate_limited' ? 'The AI judge is busy right now, so this was marked by keyword check.' : 'The AI judge did not answer, so this was marked by keyword check.';
+      else aiNote = (e && e.code) === 'bad_key' ? 'Your AI key was rejected, so this was marked by keyword check. Check it under the AI judge button.' : (e && e.code) === 'rate_limited' ? 'The AI judge is busy right now, so this was marked by keyword check.' : 'The AI judge did not answer, so this was marked by keyword check.';
     }
   }
   const sc = Math.round(kw.score*100);
