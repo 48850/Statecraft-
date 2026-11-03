@@ -1,9 +1,11 @@
-// Statecraft server for Render: serves the game and the AI judge at /api/judge.
+// Statecraft server for Render: serves the game, the AI judge at /api/judge and the cue-card reviewer at /api/review.
 // Start command: node server.js   (the ANTHROPIC_API_KEY environment variable holds the key)
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const judge = require('./api/judge.js');
+const review = require('./api/review.js');
+const ROUTES = { '/api/judge': [judge, 20000], '/api/review': [review, 80000] };
 
 const ROOT = __dirname;
 const TYPES = { '.html': 'text/html; charset=utf-8', '.jpg': 'image/jpeg', '.png': 'image/png', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
@@ -16,12 +18,14 @@ function wrap(res) {
 
 http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
-  if (url.pathname === '/api/judge') {
+  const route = ROUTES[url.pathname];
+  if (route) {
+    const [handler, limit] = route;
     let raw = '';
-    req.on('data', c => { raw += c; if (raw.length > 20000) req.destroy(); });
+    req.on('data', c => { raw += c; if (raw.length > limit) req.destroy(); });
     req.on('end', async () => {
       try { req.body = raw ? JSON.parse(raw) : null; } catch (e) { req.body = null; }
-      try { await judge(req, wrap(res)); }
+      try { await handler(req, wrap(res)); }
       catch (e) { if (!res.headersSent) wrap(res).status(500).json({ error: 'server' }); }
     });
     return;
