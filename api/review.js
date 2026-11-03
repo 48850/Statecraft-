@@ -2,7 +2,7 @@
 // Turns a student's typed answers from one session into homework cue cards:
 // each answer is lightly refined (kept in their words, errors fixed, missing key points added).
 // The API key comes from the ANTHROPIC_API_KEY environment variable, never the repo or the browser.
-const MODELS = ['claude-haiku-5-5', 'claude-haiku-4-5'];
+const { askJSON } = require('./_claude.js');
 const PER_MINUTE = 8;
 const MAX_ITEMS = 12;
 const hits = new Map();
@@ -58,25 +58,9 @@ module.exports = async function handler(req, res) {
   if (!items.length) return res.status(400).json({ error: 'missing' });
   const prompt = buildPrompt(items);
 
-  for (const model of MODELS) {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model, max_tokens: 3500, messages: [{ role: 'user', content: prompt }] })
-    });
-    if (r.ok) {
-      const d = await r.json();
-      const text = (d.content || []).map(c => c.text || '').join('');
-      const m = text.match(/\{[\s\S]*\}/);
-      if (!m) return res.status(502).json({ error: 'no_json' });
-      try { return res.status(200).json(JSON.parse(m[0])); } catch (e) { return res.status(502).json({ error: 'bad_model_json' }); }
-    }
-    const err = await r.json().catch(() => ({}));
-    const detail = (err.error && err.error.message) || '';
-    if (r.status === 404 || (r.status === 400 && /model/i.test(detail))) continue;
-    return res.status(r.status === 429 || r.status === 529 ? 429 : 502).json({ error: 'upstream', status: r.status, detail: detail.slice(0, 200) });
-  }
-  return res.status(502).json({ error: 'no_model' });
+  const r = await askJSON(key, prompt, 3500);
+  if (r.ok) return res.status(200).json(r.value);
+  return res.status(r.status).json({ error: r.error, detail: r.detail });
 };
 
 module.exports.buildPrompt = buildPrompt;

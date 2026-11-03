@@ -455,24 +455,33 @@ function marked(ans, g){
 const verdict = s => s >= .5 ? ['Strong answer', 'good'] : s >= .25 ? ['Partly there', 'part'] : ['Missed it', 'bad'];
 
 /* ---------- answer judge ---------- */
-let SAMPLE = null, aiNote = '';
+let SAMPLE = null, aiNote = '', retryAI = false;
 /* ---------- AI judge for the website: answers go to the Statecraft judge server, which holds the key ---------- */
 const JUDGE_URL = '' || (/github\.io$/.test(location.hostname) || location.protocol === 'file:' ? '' : '/api/judge');
 try { localStorage.removeItem('statecraft-ai-key'); } catch(e){}
-SAMPLE = JUDGE_URL ? { judgeCard: async (card, typed) => {
-  let r;
-  try { r = await fetch(JUDGE_URL, {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({topic: DECKS[card.d].name, q: card.q, a: card.a, answer: typed.slice(0, 1500)})}); }
-  catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
-  if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = r.status === 429 ? 'rate_limited' : 'upstream_error'; throw x; }
-  return r.json();
-}, reviewCards: async items => {
-  let r;
-  try { r = await fetch(JUDGE_URL.replace(/judge$/, 'review'), {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({items})}); }
-  catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
-  if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = r.status === 429 ? 'rate_limited' : 'upstream_error'; throw x; }
-  return r.json();
-}} : null;
+/* One POST to the judge server. Render's free plan sleeps when idle and can take up to a minute to wake,
+   so calls wait long enough for that, and one failed or cut-off request is tried again once. */
+async function postJudge(url, body, ms){
+  const err = (code, status) => { const x = new Error(code); x.code = code; x.status = status; return x; };
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++){
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+    try {
+      const r = await fetch(url, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body), signal: ctl.signal});
+      const d = await r.json().catch(() => null);
+      if (r.ok && d) return d;
+      const code = d && d.error === 'rate_limited' ? 'rate_limited' : d && d.error === 'bad_key' ? 'bad_key' : d && d.error === 'no_key' ? 'no_key' : 'upstream_error';
+      lastErr = err(code, r.status);
+      if (code !== 'upstream_error') throw lastErr;     // busy, missing or rejected key: trying again now won't help
+    } catch(e){ if (e && e.code && e.code !== 'upstream_error') throw e; lastErr = lastErr || err('upstream_error', 0); }
+    finally { clearTimeout(t); }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  throw lastErr || err('upstream_error', 0);
+}
+SAMPLE = JUDGE_URL ? { judgeCard: (card, typed) => postJudge(JUDGE_URL,
+    {topic: DECKS[card.d].name, q: card.q, a: card.a, answer: typed.slice(0, 1500)}, 75000), reviewCards: items => postJudge(JUDGE_URL.replace(/judge$/, 'review'), {items}, 120000)} : null;
+const SAMPLE_READY = JUDGE_URL ? fetch(JUDGE_URL).then(r => r.json()).then(d => { if (d && d.keySet === false){ SAMPLE = null; paintBar(); } }).catch(() => {}) : null;
 const aiReady = () => !!SAMPLE && S.ai !== false;
 function judgePrompt(card, typed){
   return `You are a fair but strict examiner marking one flashcard answer for a Year 10 Global Politics student in Australia.
@@ -497,8 +506,10 @@ Reply with only this JSON:
 {"score": <integer 0-100>, "verdict": "correct" | "partial" | "incorrect", "right": "<one short sentence to the student on what they got right; empty string if nothing>", "improve": "<one short sentence: the single most useful fix, naming any factual error; if the answer is complete, a tip to make it exam-ready>", "missing": ["<up to 3 short key points they left out or got wrong>"]}
 Write to the student directly in Australian English. Be specific to this question, not generic.`;
 }
+const aiSettled = () => SAMPLE_READY ? Promise.race([SAMPLE_READY, new Promise(r => setTimeout(r, 4000))]) : null;
 async function judgeOnce(card, typed){
   const kw = grade(card.a, typed);
+  await aiSettled();
   if (!typed.trim()) return {score:0, verdict:'incorrect', right:'', improve:'Have a go next time: even a rough answer makes the real one stick better.', missing:[], kw, ai:false};
   if (aiReady()){
     try {
@@ -507,11 +518,16 @@ async function judgeOnce(card, typed){
       const v = ['correct','partial','incorrect'].includes(r && r.verdict) ? r.verdict : (score >= 75 ? 'correct' : score >= 40 ? 'partial' : 'incorrect');
       return {score, verdict:v, right:String((r && (r.right ?? r.feedback)) || '').slice(0, 300), improve:String((r && r.improve) || '').slice(0, 300), missing:Array.isArray(r && r.missing) ? r.missing.slice(0,3).map(x => String(x).slice(0,120)) : [], kw, ai:true};
     } catch(e){
-      if (['not_granted','sampling_disabled','not_declared','capability_disabled','capability_removed','session_expired'].includes(e && e.code)){ SAMPLE = null; paintBar(); aiNote = 'The AI judge is not available here, so this was marked by keyword check.'; }
-      else aiNote = (e && e.code) === 'bad_key' ? 'Your AI key was rejected, so this was marked by keyword check. Check it under the AI judge button.' : (e && e.code) === 'rate_limited' ? 'The AI judge is busy right now, so this was marked by keyword check.' : 'The AI judge did not answer, so this was marked by keyword check.';
+      const code = e && e.code;
+      if (['not_granted','sampling_disabled','not_declared','capability_disabled','capability_removed','no_key'].includes(code)){ SAMPLE = null; paintBar(); aiNote = code === 'not_granted' ? 'The AI judge needs permission to use Claude. Allow it when asked after reloading the page; until then answers are marked by keyword check.' : 'The AI judge is not available here, so this was marked by keyword check.'; }
+      else { retryAI = true; aiNote = code === 'session_expired' ? 'You need to sign in to Claude again for the AI judge. This was marked by keyword check.'
+        : code === 'bad_key' ? 'The judge server\'s API key was rejected, so this was marked by keyword check.'
+        : code === 'rate_limited' ? 'The AI judge is busy right now, so this was marked by keyword check.'
+        : code === 'invalid_json' || code === 'empty_completion' ? 'The AI judge gave a garbled answer, so this was marked by keyword check.'
+        : 'The AI judge did not answer in time, so this was marked by keyword check.'; }
     }
   }
-  const sc = Math.round(kw.score*100);
+  const sc = Math.round(kw.score*100), retry = retryAI; retryAI = false;
   const uniq = a => [...new Map(a.map(k => [k.key, k.w])).values()];
   const got = uniq(kw.ks.filter(k => kw.hit.has(k.key))), miss = uniq(kw.ks.filter(k => !kw.hit.has(k.key)));
   const list = a => a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + ' and ' + a[a.length-1];
@@ -520,7 +536,7 @@ async function judgeOnce(card, typed){
     improve: !miss.length ? 'Every key term is there. Check your explanation links them the way the model answer does.'
       : got.length ? `Work in ${list(miss.slice(0,4))}${miss.length > 4 ? ', plus the rest of the model answer' : ''}.`
       : `None of the key terms came through. Learn the model answer's core: ${list(miss.slice(0,3))}.`,
-    missing: miss.slice(0,3), kw, ai:false};
+    missing: miss.slice(0,3), kw, ai:false, retry};
 }
 const VERDICT = {correct:['Correct','good'], partial:['Partly right','part'], incorrect:['Not quite','bad']};
 const passed = j => j.ai ? j.score >= 50 : j.kw.score >= .34;
@@ -532,7 +548,13 @@ function judgeHTML(card, j, extra=''){
     <div class="fbk">${j.right ? `<p class="ok"><small>What you got right</small>${esc(j.right)}</p>` : ''}${j.improve ? `<p class="fix"><small>${j.verdict === 'correct' ? 'To make it exam-ready' : 'To improve'}</small>${esc(j.improve)}</p>` : ''}</div>
     ${j.missing.length ? `<div class="missing"><small>Missing</small>${j.missing.map(m => `<span>${esc(m)}</span>`).join('')}</div>` : ''}
     <div class="model"><small>Model answer</small>${j.ai ? esc(card.a) : marked(card.a, j.kw)}</div>
-    ${note ? `<p class="jnote">${note}</p>` : ''}${extra}</div>`;
+    ${note ? `<p class="jnote">${note}</p>` : ''}${j.retry && aiReady() ? '<div class="row" style="justify-content:flex-start"><button type="button" class="btn" data-rejudge>Mark again with AI</button></div>' : ''}${extra}</div>`;
+}
+/* a viewer-pressed "Mark again with AI" after the AI judge fell back to keywords */
+function wireRejudge(box, card, typed, onResult){
+  const b = box && box.querySelector('[data-rejudge]'); if (!b) return;
+  b.onclick = async () => { const my = gen; b.disabled = true; b.textContent = 'Marking…';
+    const j = await judge(card, typed); if (my !== gen) return; onResult(j); };
 }
 
 /* ---------- session log + homework cue cards ---------- */
@@ -584,7 +606,7 @@ function plainCard(it){
     changed: strong ? 'Kept your answer: it covered the key points.' : it.missing && it.missing.length ? 'Built from the model answer. You missed: ' + it.missing.join('; ') + '.' : 'Built from the model answer.'};
 }
 async function reviewSession(){
-  clearTimers(); onKeys(null);
+  clearTimers(); onKeys(null); await aiSettled();
   const items = SES().sort((x, y) => x.score - y.score);
   if (!items.length){ toast('Type a few answers first'); return; }
   const my = gen, B = 12, out = new Array(items.length).fill(null);
@@ -657,8 +679,9 @@ function learn(){
     const reveal = () => { if (on) return; on = true; const typed = $('#ty').value.trim();
       $('#fc').classList.add('on'); btns.forEach(x => x.disabled = false); $('#rev').disabled = true; $('#ty').disabled = true;
       if (typed){ const my = gen, c0 = cur; $('#ans').style.display = 'none'; $('#vd').innerHTML = thinkingHTML();
-        judge(c0, typed).then(j => { if (my !== gen) return; $('#vd').innerHTML = judgeHTML(c0, j); blip(j.verdict === 'incorrect' ? 'bad' : 'good');
-          const sg = suggestConf(j.score); btns.forEach(x => x.classList.toggle('sug', +x.dataset.r === sg)); }); } };
+        const show = j => { if (my !== gen) return; $('#vd').innerHTML = judgeHTML(c0, j); blip(j.verdict === 'incorrect' ? 'bad' : 'good');
+          const sg = suggestConf(j.score); btns.forEach(x => x.classList.toggle('sug', +x.dataset.r === sg)); wireRejudge($('#vd'), c0, typed, show); };
+        judge(c0, typed).then(show); } };
     $('#rev').onclick = reveal; $('#fc').onclick = reveal;
     $('#ty').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); reveal(); } };
     const rate = r => { if (!on) return; setConf(cur.id, r); done++; gain(2 + r); blip(r >= 4 ? 'good' : r <= 2 ? 'bad' : 'good');
@@ -689,16 +712,21 @@ function recall(list){
     let done = false;
     const submit = async () => { if (done) return; done = true; const my = gen;
       $('#ty').disabled = true; $('#go').disabled = true; $('#fb').innerHTML = thinkingHTML();
-      const j = await judge(c, $('#ty').value); if (my !== gen) return; const p = j.score;
-      const sg = suggestConf(j.score);
-      $('#fb').innerHTML = judgeHTML(c, j, `${confRow(sg)}<div class="row ovrow"><button type="button" class="btn" id="ovr">The marking was wrong: I knew it</button></div>`);
-      let got = passed(j); pts += p; if (!got) missed.push(c); else right++;
-      blip(got ? 'good' : 'bad');
-      $('#ovr').onclick = () => { if (!got){ got = true; right++; missed.pop(); pts += 50 - Math.min(50, p); $('#ovr').disabled = true; $('#ovr').textContent = 'Counted as right'; } };
-      const next = r => { setConf(c.id, r); onKeys(null); n++; ask(); };
-      app.querySelectorAll('.cbtn').forEach(x => x.onclick = () => next(+x.dataset.r));
-      onKeys(e => { if (e.target.tagName === 'TEXTAREA' || e.repeat) return; const k = +e.key; if (k >= 1 && k <= 5) next(k); else if (e.key === 'Enter'){ e.preventDefault(); next(sg); } });
-      app.querySelector('.cbtn.sug').focus({preventScroll:true}); };
+      const typed = $('#ty').value;
+      let counted = false, got = false, p = 0, bonus = 0;
+      const show = j => { if (my !== gen) return;
+        if (counted){ pts -= p + bonus; if (got) right--; else missed.pop(); }
+        p = j.score; bonus = 0; got = passed(j); pts += p; if (!got) missed.push(c); else right++; counted = true;
+        const sg = suggestConf(j.score);
+        $('#fb').innerHTML = judgeHTML(c, j, `${confRow(sg)}<div class="row ovrow"><button type="button" class="btn" id="ovr">The marking was wrong: I knew it</button></div>`);
+        blip(got ? 'good' : 'bad');
+        $('#ovr').onclick = () => { if (!got){ got = true; right++; missed.pop(); bonus = 50 - Math.min(50, p); pts += bonus; $('#ovr').disabled = true; $('#ovr').textContent = 'Counted as right'; } };
+        const next = r => { setConf(c.id, r); onKeys(null); n++; ask(); };
+        app.querySelectorAll('.cbtn').forEach(x => x.onclick = () => next(+x.dataset.r));
+        onKeys(e => { if (e.target.tagName === 'TEXTAREA' || e.repeat) return; const k = +e.key; if (k >= 1 && k <= 5) next(k); else if (e.key === 'Enter'){ e.preventDefault(); next(sg); } });
+        wireRejudge($('#fb'), c, typed, show);
+        app.querySelector('.cbtn.sug').focus({preventScroll:true}); };
+      show(await judge(c, typed)); };
     $('#go').onclick = submit;
     $('#ty').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submit(); } };
   }
@@ -793,7 +821,7 @@ function boss(){
       const cast = async () => { if (locked) return; locked = true; const my = gen;
         $('#ty').disabled = true; $('#go').disabled = true; $('#fb').innerHTML = thinkingHTML(); taunt('Let the judge decide…');
         const j = await judge(card, $('#ty').value); if (my !== gen || over) return;
-        $('#fb').innerHTML = judgeHTML(card, j);
+        $('#fb').innerHTML = judgeHTML(card, Object.assign({}, j, {retry:false}));   // the battle moves on, so no re-mark button
         if (passed(j)){ const dmg = Math.min(50, 22 + Math.round(j.score*.25) + combo*3); combo++; $('#cb').textContent = combo; playerHits(dmg, true); }
         else { combo = 0; $('#cb').textContent = 0; missed.push(card); bossHits(); }
         later(ask, 3600); };
