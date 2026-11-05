@@ -5,7 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const judge = require('./api/judge.js');
 const review = require('./api/review.js');
-const ROUTES = { '/api/judge': [judge, 20000], '/api/review': [review, 80000] };
+const exam = require('./api/exam.js');
+const ROUTES = { '/api/judge': [judge, 20000], '/api/review': [review, 80000], '/api/exam': [exam, 40000] };
 
 const ROOT = __dirname;
 const TYPES = { '.html': 'text/html; charset=utf-8', '.jpg': 'image/jpeg', '.png': 'image/png', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
