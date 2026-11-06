@@ -262,6 +262,21 @@ b.good{color:var(--good)} b.part{color:var(--gold)} b.bad{color:var(--bad)}
 .missing span{background:rgba(255,93,115,.14);border:1px solid rgba(255,93,115,.4);color:#ffc2cb;border-radius:8px;padding:3px 8px;font-size:14px}
 .model{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);color:var(--ink-2);font-size:15.5px}
 .jnote{margin:10px 0 0;font-size:13px;color:var(--ink-3)}
+.pts,.errs,.extra,.steps{margin-top:12px}
+.pts small,.errs small,.extra small,.steps small,.tip small{display:block;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:700;margin-bottom:6px}
+.pts ul{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.pts li{display:flex;gap:10px;align-items:flex-start;padding:8px 10px;border-radius:10px;border:1px solid var(--line);font-size:15px}
+.pts li b{display:block;font-weight:600;color:var(--ink)} .pts li em{display:block;font-style:normal;color:var(--ink-2);font-size:14px;margin-top:2px}
+.pts .pi{flex:none;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:800}
+.pts .s-got{border-color:rgba(70,210,140,.4)} .pts .s-got .pi{background:rgba(70,210,140,.18);color:var(--good)}
+.pts .s-partial{border-color:rgba(255,200,80,.4)} .pts .s-partial .pi{background:rgba(255,200,80,.18);color:var(--gold)}
+.pts .s-missing,.pts .s-wrong{border-color:rgba(255,93,115,.4)} .pts .s-missing .pi,.pts .s-wrong .pi{background:rgba(255,93,115,.16);color:var(--bad)}
+.errs p{margin:4px 0;font-size:15px} .errs s{color:#ffc2cb;margin-right:8px} .errs span{color:var(--good)}
+.extra{display:flex;flex-wrap:wrap;gap:6px;align-items:center} .extra small{width:100%}
+.extra span{background:rgba(70,210,140,.12);border:1px solid rgba(70,210,140,.4);border-radius:8px;padding:3px 8px;font-size:14px}
+.steps ol{margin:0;padding-left:20px;font-size:15px;color:var(--ink)} .steps li{margin:3px 0}
+.model.up{color:var(--ink);border-top-color:rgba(255,200,80,.45)}
+.tip{margin:12px 0 0;font-size:15px;color:var(--ink-2)}
 .feedback.thinking{color:var(--ink-2);display:flex;align-items:center;gap:10px}
 .gavel{display:inline-block;color:var(--gold);font-size:20px;animation:gavel .8s ease-in-out infinite}
 @keyframes gavel{50%{transform:rotate(-25deg)}}
@@ -487,31 +502,50 @@ function marked(ans, g){
 const verdict = s => s >= .5 ? ['Strong answer', 'good'] : s >= .25 ? ['Partly there', 'part'] : ['Missed it', 'bad'];
 
 /* ---------- answer judge ---------- */
-let SAMPLE = null, aiNote = '';
+let SAMPLE = null, aiNote = '', retryAI = false;
 /* ---------- AI judge for the website: answers go to the Statecraft judge server, which holds the key ---------- */
-const JUDGE_URL = '' || (/github\.io$/.test(location.hostname) || location.protocol === 'file:' ? '' : '/api/judge');
+// AI_SERVER: the Render web service that holds the key. The GitHub Pages copy and local files call it;
+// a page served by that server itself just uses /api/judge on the same host.
+const AI_SERVER = '';
+const JUDGE_URL = (/github\.io$/.test(location.hostname) || location.protocol === 'file:') ? (AI_SERVER ? AI_SERVER.replace(/\/+$/, '') + '/api/judge' : '') : '/api/judge';
+/* One POST to the judge server. Render's free plan sleeps when idle and can take up to a minute to wake,
+   so calls wait long enough for that, and one failed or cut-off request is tried again once. */
+async function postAI(url, body, ms){
+  const err = (code, detail) => { const x = new Error(code); x.code = code; x.detail = detail || ''; return x; };
+  let last = null;
+  for (let attempt = 0; attempt < 2; attempt++){
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+    try {
+      const r = await fetch(url, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body), signal: ctl.signal});
+      const d = await r.json().catch(() => null);
+      if (r.ok && d) return d;
+      const e = d && d.error;
+      const code = r.status === 429 || e === 'rate_limited' ? 'rate_limited' : ['no_key','bad_key','origin','missing','bad_json'].includes(e) ? e
+        : e === 'timeout' ? 'timeout' : e === 'bad_model_json' ? 'garbled' : r.status >= 502 && !e ? 'offline' : 'upstream_error';
+      console.warn('[Statecraft AI]', r.status, d);
+      last = err(code, d && d.detail);
+      if (!['upstream_error','offline','timeout','garbled'].includes(code)) throw last;   // retrying won't help
+    } catch(e){
+      if (e && e.code && !['upstream_error','offline','timeout','garbled'].includes(e.code)) throw e;
+      if (!(e && e.code)){ console.warn('[Statecraft AI] no response', e); last = err(e && e.name === 'AbortError' ? 'timeout' : 'offline'); }
+    } finally { clearTimeout(t); }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  throw last || err('upstream_error');
+}
+const AI_WHY = {rate_limited: 'is busy right now', no_key: 'has no API key set on the server (ANTHROPIC_API_KEY on Render)', bad_key: "server's API key was rejected",
+  origin: 'refused this site (origin not allowed)', offline: 'server could not be reached (asleep or offline)', timeout: 'took too long to answer', garbled: 'gave a garbled reply'};
+const aiWhy = (code, who) => 'The AI ' + who + ' ' + (AI_WHY[code] || 'did not answer') + ', so ';
 try { localStorage.removeItem('statecraft-ai-key'); } catch(e){}
-SAMPLE = JUDGE_URL ? { judgeCard: async (card, typed) => {
-  let r;
-  try { r = await fetch(JUDGE_URL, {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({topic: DECKS[card.d].name, subject: DECKS[card.d].subject, term: TERM(card.q), q: card.q, a: card.a, answer: typed.slice(0, 1500)})}); }
-  catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
-  if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = r.status === 429 ? 'rate_limited' : 'upstream_error'; throw x; }
-  return r.json();
-}, examCard: async (ex, typed) => {
-  let r;
-  try { r = await fetch(JUDGE_URL.replace(/judge$/, 'exam'), {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({subject: DECKS[ex.d].subject, topic: DECKS[ex.d].name, term: ex.t, marks: ex.m, q: ex.q, guide: ex.g, answer: typed.slice(0, 6000)})}); }
-  catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
-  if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = r.status === 429 ? 'rate_limited' : 'upstream_error'; throw x; }
-  return r.json();
-}, reviewCards: async items => {
-  let r;
-  try { r = await fetch(JUDGE_URL.replace(/judge$/, 'review'), {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({items})}); }
-  catch(e){ const x = new Error('network'); x.code = 'upstream_error'; throw x; }
-  if (!r.ok){ const x = new Error('HTTP ' + r.status); x.code = r.status === 429 ? 'rate_limited' : 'upstream_error'; throw x; }
-  return r.json();
-}} : null;
+const AI_PATH = p => JUDGE_URL.replace(/judge$/, p);
+SAMPLE = JUDGE_URL ? {
+  judgeCard: (card, typed) => postAI(JUDGE_URL, {topic: DECKS[card.d].name, subject: DECKS[card.d].subject, term: TERM(card.q), q: card.q, a: card.a, answer: typed.slice(0, 1500)}, 75000),
+  examCard: (ex, typed) => postAI(AI_PATH('exam'), {subject: DECKS[ex.d].subject, topic: DECKS[ex.d].name, term: ex.t, marks: ex.m, q: ex.q, guide: ex.g, answer: typed.slice(0, 6000)}, 100000),
+  reviewCards: items => postAI(AI_PATH('review'), {items}, 130000)
+} : null;
+/* Wake the judge server as soon as the page opens, and switch AI off only if the server says it has no key. */
+const SAMPLE_READY = JUDGE_URL ? fetch(JUDGE_URL).then(r => r.json()).then(d => { if (d && d.keySet === false){ SAMPLE = null; aiNote = ''; paintBar(); } }).catch(() => {}) : null;
+const aiSettled = () => SAMPLE_READY ? Promise.race([SAMPLE_READY, new Promise(r => setTimeout(r, 4000))]) : null;
 const aiReady = () => !!SAMPLE && S.ai !== false;
 function judgePrompt(card, typed){
   const tn = TERM(card.q), ti = window.VCAA && VCAA.info(tn);
@@ -541,19 +575,30 @@ Write to the student directly in Australian English. Be specific to this questio
 async function judgeOnce(card, typed){
   const kw = grade(card.a, typed);
   if (!typed.trim()) return {score:0, verdict:'incorrect', right:'', improve:'Have a go next time: even a rough answer makes the real one stick better.', missing:[], kw, ai:false};
+  await aiSettled();
   if (aiReady()){
     try {
       const r = SAMPLE.judgeCard ? await SAMPLE.judgeCard(card, typed) : await SAMPLE.json(judgePrompt(card, typed), {modelTier:'quick'});
       const score = Math.max(0, Math.min(100, Math.round(Number(r && r.score) || 0)));
       const v = ['correct','partial','incorrect'].includes(r && r.verdict) ? r.verdict : (score >= 75 ? 'correct' : score >= 40 ? 'partial' : 'incorrect');
-      return {score, verdict:v, right:String((r && (r.right ?? r.feedback)) || '').slice(0, 300), improve:String((r && r.improve) || '').slice(0, 300), missing:Array.isArray(r && r.missing) ? r.missing.slice(0,3).map(x => String(x).slice(0,120)) : [], term: TERM(card.q), term_met: r && r.term_met === false ? false : true, kw, ai:true};
+      const arr = (x, n) => Array.isArray(x) ? x.slice(0, n) : [], str = (x, n) => String(x == null ? '' : x).slice(0, n);
+      const points = arr(r && r.points, 6).filter(p => p && p.idea).map(p => ({idea: str(p.idea, 140), status: ['got','partial','missing','wrong'].includes(p.status) ? p.status : 'missing', note: str(p.note, 220)}));
+      const missing = arr(r && r.missing, 4).map(x => str(x, 120)).filter(Boolean);
+      return {score, verdict:v, right:str(r && (r.right ?? r.feedback), 300), improve:str(r && r.improve, 300),
+        missing: missing.length ? missing : points.filter(p => p.status !== 'got').map(p => p.idea).slice(0, 4),
+        points, errors: arr(r && r.errors, 4).filter(e => e && (e.wrong || e.fix)).map(e => ({wrong: str(e.wrong, 200), fix: str(e.fix, 220)})),
+        extra: arr(r && r.extra, 3).map(x => str(x, 200)).filter(Boolean), upgrade: str(r && r.upgrade, 900), tip: str(r && r.tip, 240),
+        term: TERM(card.q), term_met: r && r.term_met === false ? false : true, term_feedback: str(r && r.term_feedback, 300), kw, ai:true};
     } catch(e){
       if (['not_granted','sampling_disabled','not_declared','capability_disabled','capability_removed','session_expired'].includes(e && e.code)){ SAMPLE = null; paintBar(); aiNote = 'The AI judge is not available here, so this was marked by keyword check.'; }
-      else aiNote = (e && e.code) === 'bad_key' ? 'Your AI key was rejected, so this was marked by keyword check. Check it under the AI judge button.' : (e && e.code) === 'rate_limited' ? 'The AI judge is busy right now, so this was marked by keyword check.' : 'The AI judge did not answer, so this was marked by keyword check.';
+      else if ((e && e.code) === 'no_key'){ SAMPLE = null; paintBar(); aiNote = aiWhy('no_key', 'judge') + 'this was marked by keyword check.'; }
+      else { retryAI = true; aiNote = aiWhy(e && e.code, 'judge') + 'this was marked by keyword check.'; }
     }
   }
+  else if (!SAMPLE && !aiNote) aiNote = 'AI marking is not connected on this copy of the site, so this was marked by keyword check.';
   const tn = TERM(card.q), tc = window.VCAA ? VCAA.meets(tn, typed) : {met:true, miss:''};
   let sc = Math.round(kw.score*100); if (!tc.met) sc = Math.min(sc, 60);
+  const retry = retryAI; retryAI = false;
   const uniq = a => [...new Map(a.map(k => [k.key, k.w])).values()];
   const got = uniq(kw.ks.filter(k => kw.hit.has(k.key))), miss = uniq(kw.ks.filter(k => !kw.hit.has(k.key)));
   const list = a => a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + ' and ' + a[a.length-1];
@@ -562,20 +607,38 @@ async function judgeOnce(card, typed){
     improve: !miss.length ? 'Every key term is there. Check your explanation links them the way the model answer does.'
       : got.length ? `Work in ${list(miss.slice(0,4))}${miss.length > 4 ? ', plus the rest of the model answer' : ''}.`
       : `None of the key terms came through. Learn the model answer's core: ${list(miss.slice(0,3))}.`,
-    missing: miss.slice(0,3), term: tn, term_met: tc.met, term_miss: tc.miss, kw, ai:false};
+    missing: miss.slice(0,3), term: tn, term_met: tc.met, term_miss: tc.miss, kw, ai:false, retry};
 }
 const VERDICT = {correct:['Correct','good'], partial:['Partly right','part'], incorrect:['Not quite','bad']};
 const passed = j => j.ai ? j.score >= 50 : j.kw.score >= .34;
 const thinkingHTML = () => `<div class="feedback thinking">${aiReady() ? '<span class="gavel" aria-hidden="true">⚖</span> The AI judge is reviewing your answer…' : 'Marking…'}</div>`;
+const PT = {got: ['✓', 'Got it'], partial: ['◐', 'Partly'], missing: ['✗', 'Missing'], wrong: ['✗', 'Wrong']};
+const pointsHTML = (pts, key, label) => pts && pts.length ? `<div class="pts"><small>${label}</small><ul>${pts.map(p =>
+  `<li class="s-${p.status}"><span class="pi" aria-label="${PT[p.status][1]}">${PT[p.status][0]}</span><div><b>${esc(p[key])}</b>${p.note ? `<em>${esc(p.note)}</em>` : ''}</div></li>`).join('')}</ul></div>` : '';
+const errorsHTML = errs => errs && errs.length ? `<div class="errs"><small>Fix these errors</small>${errs.map(e =>
+  `<p>${e.wrong ? `<s>${esc(e.wrong)}</s>` : ''}${e.fix ? `<span>→ ${esc(e.fix)}</span>` : ''}</p>`).join('')}</div>` : '';
 function judgeHTML(card, j, extra=''){
   const [label, cl] = VERDICT[j.verdict];
   const note = aiNote; aiNote = '';
+  const detailed = j.ai && j.points && j.points.length;
   return `<div class="feedback"><div class="jhead"><b class="${cl}">${label}</b><span class="jscore">${j.score}/100</span><span class="by">${j.ai ? 'AI judge' : 'Keyword check'}</span></div>
-    ${j.term && j.term_met === false ? `<p class="tmet no"><small>Command term: ${esc(j.term)} not met</small>${esc(j.term_miss || (window.VCAA && VCAA.info(j.term) ? VCAA.info(j.term).need : ''))}</p>` : ''}
+    ${j.term && j.term_met === false ? `<p class="tmet no"><small>Command term: ${esc(j.term)} not met</small>${esc(j.term_feedback || j.term_miss || (window.VCAA && VCAA.info(j.term) ? VCAA.info(j.term).need : ''))}</p>`
+      : j.ai && j.term && j.term_feedback ? `<p class="tmet ok"><small>Command term: ${esc(j.term)} met</small>${esc(j.term_feedback)}</p>` : ''}
     <div class="fbk">${j.right ? `<p class="ok"><small>What you got right</small>${esc(j.right)}</p>` : ''}${j.improve ? `<p class="fix"><small>${j.verdict === 'correct' ? 'To make it exam-ready' : 'To improve'}</small>${esc(j.improve)}</p>` : ''}</div>
-    ${j.missing.length ? `<div class="missing"><small>Missing</small>${j.missing.map(m => `<span>${esc(m)}</span>`).join('')}</div>` : ''}
+    ${pointsHTML(j.points, 'idea', 'Point by point')}
+    ${errorsHTML(j.errors)}
+    ${j.extra && j.extra.length ? `<div class="extra"><small>Extra credit</small>${j.extra.map(x => `<span>${esc(x)}</span>`).join('')}</div>` : ''}
+    ${!detailed && j.missing.length ? `<div class="missing"><small>Missing</small>${j.missing.map(m => `<span>${esc(m)}</span>`).join('')}</div>` : ''}
+    ${j.upgrade ? `<div class="model up"><small>Your answer, upgraded</small>${esc(j.upgrade)}</div>` : ''}
     <div class="model"><small>Model answer</small>${j.ai ? esc(card.a) : marked(card.a, j.kw)}</div>
-    ${note ? `<p class="jnote">${note}</p>` : ''}${extra}</div>`;
+    ${j.tip ? `<p class="tip"><small>Exam tip</small>${esc(j.tip)}</p>` : ''}
+    ${note ? `<p class="jnote">${note}</p>` : ''}${j.retry && aiReady() ? '<div class="row" style="justify-content:flex-start"><button type="button" class="btn" data-rejudge>Mark again with AI</button></div>' : ''}${extra}</div>`;
+}
+/* a viewer-pressed "Mark again with AI" after the AI judge fell back to keywords */
+function wireRejudge(box, card, typed, onResult){
+  const b = box && box.querySelector('[data-rejudge]'); if (!b) return;
+  b.onclick = async () => { const my = gen; b.disabled = true; b.textContent = 'Marking…';
+    const j = await judge(card, typed); if (my !== gen) return; onResult(j); };
 }
 
 /* ---------- session log + homework cue cards ---------- */
@@ -627,7 +690,7 @@ function plainCard(it){
     changed: strong ? 'Kept your answer: it covered the key points.' : it.missing && it.missing.length ? 'Built from the model answer. You missed: ' + it.missing.join('; ') + '.' : 'Built from the model answer.'};
 }
 async function reviewSession(){
-  clearTimers(); onKeys(null);
+  clearTimers(); onKeys(null); await aiSettled();
   const items = SES().sort((x, y) => x.score - y.score);
   if (!items.length){ toast('Type a few answers first'); return; }
   const my = gen, B = 12, out = new Array(items.length).fill(null);
@@ -637,7 +700,7 @@ async function reviewSession(){
   if (aiReady()){
     for (let s = 0; s < items.length; s += B){
       try { (await refineBatch(items.slice(s, s + B))).forEach((c, k) => out[s + k] = c); }
-      catch(e){ note = (e && e.code) === 'rate_limited' ? 'The AI was busy, so some cards use the model answer instead.' : 'The AI did not answer, so some cards use the model answer instead.'; }
+      catch(e){ note = aiWhy(e && e.code, 'reviewer') + 'some cards use the model answer instead.'; }
       if (my !== gen) return;
       $('#prog').textContent = Math.min(items.length, s + B) + ' / ' + items.length;
     }
@@ -700,8 +763,9 @@ function learn(){
     const reveal = () => { if (on) return; on = true; const typed = $('#ty').value.trim();
       $('#fc').classList.add('on'); btns.forEach(x => x.disabled = false); $('#rev').disabled = true; $('#ty').disabled = true;
       if (typed){ const my = gen, c0 = cur; $('#ans').style.display = 'none'; $('#vd').innerHTML = thinkingHTML();
-        judge(c0, typed).then(j => { if (my !== gen) return; $('#vd').innerHTML = judgeHTML(c0, j); blip(j.verdict === 'incorrect' ? 'bad' : 'good');
-          const sg = suggestConf(j.score); btns.forEach(x => x.classList.toggle('sug', +x.dataset.r === sg)); }); } };
+        const show = j => { if (my !== gen) return; $('#vd').innerHTML = judgeHTML(c0, j); blip(j.verdict === 'incorrect' ? 'bad' : 'good');
+          const sg = suggestConf(j.score); btns.forEach(x => x.classList.toggle('sug', +x.dataset.r === sg)); wireRejudge($('#vd'), c0, typed, show); };
+        judge(c0, typed).then(show); } };
     $('#rev').onclick = reveal; $('#fc').onclick = reveal;
     $('#ty').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); reveal(); } };
     const rate = r => { if (!on) return; setConf(cur.id, r); done++; gain(2 + r); blip(r >= 4 ? 'good' : r <= 2 ? 'bad' : 'good');
@@ -739,15 +803,20 @@ function examOffline(ex, typed){
 }
 async function examJudge(ex, typed){
   if (!typed.trim()) return {mark:0, marks:ex.m, term_met:false, term_feedback:'Nothing written.', right:'', improve:'Have a go: a rough plan of three points beats a blank page.', missing:[], model:'', ai:false};
+  await aiSettled();
   if (aiReady() && SAMPLE.examCard){
     try {
       const r = await SAMPLE.examCard(ex, typed);
       const mark = Math.max(0, Math.min(ex.m, Math.round(Number(r && r.mark) || 0)));
       return {mark: r && r.term_met === false ? Math.min(mark, Math.floor(ex.m / 2)) : mark, marks: ex.m, term_met: !(r && r.term_met === false),
         term_feedback: String((r && r.term_feedback) || '').slice(0, 400), right: String((r && r.right) || '').slice(0, 400), improve: String((r && r.improve) || '').slice(0, 400),
-        missing: Array.isArray(r && r.missing) ? r.missing.slice(0, 4).map(x => String(x).slice(0, 160)) : [], model: String((r && r.model) || '').slice(0, 2500), ai: true};
-    } catch(e){ aiNote = (e && e.code) === 'rate_limited' ? 'The AI examiner is busy right now, so this was marked by keyword and command-term check.' : 'The AI examiner did not answer, so this was marked by keyword and command-term check.'; }
+        missing: Array.isArray(r && r.missing) ? r.missing.slice(0, 4).map(x => String(x).slice(0, 160)) : [], model: String((r && r.model) || '').slice(0, 2500),
+        criteria: (Array.isArray(r && r.criteria) ? r.criteria : []).slice(0, 8).filter(c => c && c.point).map(c => ({point: String(c.point).slice(0, 160), status: ['got','partial','missing','wrong'].includes(c.status) ? c.status : 'missing', note: String(c.note || '').slice(0, 260)})),
+        errors: (Array.isArray(r && r.errors) ? r.errors : []).slice(0, 5).filter(e => e && (e.wrong || e.fix)).map(e => ({wrong: String(e.wrong || '').slice(0, 200), fix: String(e.fix || '').slice(0, 240)})),
+        structure: String((r && r.structure) || '').slice(0, 300), next_steps: (Array.isArray(r && r.next_steps) ? r.next_steps : []).slice(0, 3).map(x => String(x).slice(0, 220)).filter(Boolean), ai: true};
+    } catch(e){ aiNote = aiWhy(e && e.code, 'examiner') + 'this was marked by keyword and command-term check.'; }
   }
+  else if (!SAMPLE && !aiNote) aiNote = 'AI marking is not connected on this copy of the site, so this was marked by keyword and command-term check.';
   return examOffline(ex, typed);
 }
 function examHTML(ex, j){
@@ -755,7 +824,11 @@ function examHTML(ex, j){
   return `<div class="feedback"><div class="jhead"><b class="${cl}">${j.mark} / ${j.marks}</b><span class="jscore">${Math.round(pct * 100)}%</span><span class="by">${j.ai ? 'AI examiner' : 'Keyword + term check'}</span></div>
     <p class="tmet ${j.term_met ? 'ok' : 'no'}"><small>Command term: ${esc(ex.t)} ${j.term_met ? 'met' : 'not met (capped at half marks)'}</small>${esc(j.term_feedback)}</p>
     <div class="fbk">${j.right ? `<p class="ok"><small>What earned marks</small>${esc(j.right)}</p>` : ''}${j.improve ? `<p class="fix"><small>To get the next mark</small>${esc(j.improve)}</p>` : ''}</div>
-    ${j.missing.length ? `<div class="missing"><small>Missing</small>${j.missing.map(m => `<span>${esc(m)}</span>`).join('')}</div>` : ''}
+    ${pointsHTML(j.criteria, 'point', 'Marking guide, point by point')}
+    ${errorsHTML(j.errors)}
+    ${j.structure ? `<p class="tip"><small>Structure and expression</small>${esc(j.structure)}</p>` : ''}
+    ${j.next_steps && j.next_steps.length ? `<div class="steps"><small>For your rewrite</small><ol>${j.next_steps.map(x => `<li>${esc(x)}</li>`).join('')}</ol></div>` : ''}
+    ${!(j.criteria && j.criteria.length) && j.missing.length ? `<div class="missing"><small>Missing</small>${j.missing.map(m => `<span>${esc(m)}</span>`).join('')}</div>` : ''}
     ${j.model ? `<div class="model"><small>Full-mark answer</small>${esc(j.model).replace(/\n/g, '<br>')}</div>` : ''}
     <div class="model"><small>Marking guide</small>${esc(ex.g)}</div>
     ${note ? `<p class="jnote">${note}</p>` : ''}</div>`;
@@ -816,16 +889,21 @@ function recall(list){
     let done = false;
     const submit = async () => { if (done) return; done = true; const my = gen;
       $('#ty').disabled = true; $('#go').disabled = true; $('#fb').innerHTML = thinkingHTML();
-      const j = await judge(c, $('#ty').value); if (my !== gen) return; const p = j.score;
-      const sg = suggestConf(j.score);
-      $('#fb').innerHTML = judgeHTML(c, j, `${confRow(sg)}<div class="row ovrow"><button type="button" class="btn" id="ovr">The marking was wrong: I knew it</button></div>`);
-      let got = passed(j); pts += p; if (!got) missed.push(c); else right++;
-      blip(got ? 'good' : 'bad');
-      $('#ovr').onclick = () => { if (!got){ got = true; right++; missed.pop(); pts += 50 - Math.min(50, p); $('#ovr').disabled = true; $('#ovr').textContent = 'Counted as right'; } };
-      const next = r => { setConf(c.id, r); onKeys(null); n++; ask(); };
-      app.querySelectorAll('.cbtn').forEach(x => x.onclick = () => next(+x.dataset.r));
-      onKeys(e => { if (e.target.tagName === 'TEXTAREA' || e.repeat) return; const k = +e.key; if (k >= 1 && k <= 5) next(k); else if (e.key === 'Enter'){ e.preventDefault(); next(sg); } });
-      app.querySelector('.cbtn.sug').focus({preventScroll:true}); };
+      const typed = $('#ty').value;
+      let counted = false, got = false, p = 0, bonus = 0;
+      const show = j => { if (my !== gen) return;
+        if (counted){ pts -= p + bonus; if (got) right--; else missed.pop(); }
+        p = j.score; bonus = 0; got = passed(j); pts += p; if (!got) missed.push(c); else right++; counted = true;
+        const sg = suggestConf(j.score);
+        $('#fb').innerHTML = judgeHTML(c, j, `${confRow(sg)}<div class="row ovrow"><button type="button" class="btn" id="ovr">The marking was wrong: I knew it</button></div>`);
+        blip(got ? 'good' : 'bad');
+        $('#ovr').onclick = () => { if (!got){ got = true; right++; missed.pop(); bonus = 50 - Math.min(50, p); pts += bonus; $('#ovr').disabled = true; $('#ovr').textContent = 'Counted as right'; } };
+        const next = r => { setConf(c.id, r); onKeys(null); n++; ask(); };
+        app.querySelectorAll('.cbtn').forEach(x => x.onclick = () => next(+x.dataset.r));
+        onKeys(e => { if (e.target.tagName === 'TEXTAREA' || e.repeat) return; const k = +e.key; if (k >= 1 && k <= 5) next(k); else if (e.key === 'Enter'){ e.preventDefault(); next(sg); } });
+        wireRejudge($('#fb'), c, typed, show);
+        app.querySelector('.cbtn.sug').focus({preventScroll:true}); };
+      show(await judge(c, typed)); };
     $('#go').onclick = submit;
     $('#ty').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); submit(); } };
   }
@@ -922,7 +1000,7 @@ function boss(){
       const cast = async () => { if (locked) return; locked = true; const my = gen;
         $('#ty').disabled = true; $('#go').disabled = true; $('#fb').innerHTML = thinkingHTML(); taunt('Let the judge decide…');
         const j = await judge(card, $('#ty').value); if (my !== gen || over) return;
-        $('#fb').innerHTML = judgeHTML(card, j);
+        $('#fb').innerHTML = judgeHTML(card, Object.assign({}, j, {retry:false, points:[], extra:[], upgrade:'', tip:''}));   // the battle moves on fast: keep it short
         if (passed(j)){ const dmg = Math.min(50, 22 + Math.round(j.score*.25) + combo*3); combo++; $('#cb').textContent = combo; playerHits(dmg, true); }
         else { combo = 0; $('#cb').textContent = 0; missed.push(card); bossHits(); }
         later(ask, 3600); };
