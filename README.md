@@ -29,3 +29,8 @@ Made by Elliot Thevathasan.
 
 ## AI marking
 Typed answers are marked by `api/judge.js`, exam questions by `api/exam.js`, and session reviews are refined by `api/review.js`, all serverless functions. Deploy on Render as a Web Service (build command `npm install`, start command `node server.js`) or on Vercel, and set the `ANTHROPIC_API_KEY` environment variable there. The key is never stored in this repo or sent to the browser. Without it, answers fall back to keyword marking plus a command-term check.
+
+How the marking works: the judge breaks the model answer (or marking guide) into its key ideas and ticks each one as got, partial, missing or wrong. It also lists factual errors with corrections and checks the command term, then scores from that checklist. The server applies the caps itself (60/100, or half marks, when the command term isn't met). Feedback includes the checklist, the errors, extra credit, your answer upgraded to full marks, and an exam tip. Replies are forced into a fixed JSON schema, and failed calls are retried.
+
+- Models: Sonnet 5.5 by default, falling back to Haiku. Set `JUDGE_MODELS` on Render (e.g. `claude-haiku-5-5`) to use a cheaper model.
+- The GitHub Pages copy can use the Render judge: put the Render URL in `AI_SERVER` in `index.html`. The server accepts requests from `48850.github.io`; add other sites with `ALLOWED_ORIGINS`.

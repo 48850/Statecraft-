@@ -2,7 +2,8 @@
 // Turns a student's typed answers from one session into homework cue cards:
 // each answer is lightly refined (kept in their words, errors fixed, missing key points added).
 // The API key comes from the ANTHROPIC_API_KEY environment variable, never the repo or the browser.
-const MODELS = ['claude-haiku-5-5', 'claude-haiku-4-5'];
+const gate = require('./_cors.js');
+const { askJSON } = require('./_claude.js');
 const PER_MINUTE = 8;
 const MAX_ITEMS = 12;
 const hits = new Map();
@@ -40,10 +41,9 @@ Reply with only this JSON, one entry per item, in order:
 
 module.exports = async function handler(req, res) {
   const key = process.env.ANTHROPIC_API_KEY;
+  if (!gate(req, res)) return;
   if (req.method === 'GET') return res.status(200).json({ ok: true, keySet: Boolean(key) });
   if (req.method !== 'POST') return res.status(405).json({ error: 'method' });
-  const origin = req.headers.origin || '', host = req.headers.host || '';
-  if (origin && origin.replace(/^https?:\/\//, '') !== host) return res.status(403).json({ error: 'origin' });
   if (!key) return res.status(500).json({ error: 'no_key' });
   const ip = String(req.headers['x-forwarded-for'] || 'unknown').split(',')[0].trim();
   if (limited(ip)) return res.status(429).json({ error: 'rate_limited' });
@@ -58,25 +58,9 @@ module.exports = async function handler(req, res) {
   if (!items.length) return res.status(400).json({ error: 'missing' });
   const prompt = buildPrompt(items);
 
-  for (const model of MODELS) {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model, max_tokens: 3500, messages: [{ role: 'user', content: prompt }] })
-    });
-    if (r.ok) {
-      const d = await r.json();
-      const text = (d.content || []).map(c => c.text || '').join('');
-      const m = text.match(/\{[\s\S]*\}/);
-      if (!m) return res.status(502).json({ error: 'no_json' });
-      try { return res.status(200).json(JSON.parse(m[0])); } catch (e) { return res.status(502).json({ error: 'bad_model_json' }); }
-    }
-    const err = await r.json().catch(() => ({}));
-    const detail = (err.error && err.error.message) || '';
-    if (r.status === 404 || (r.status === 400 && /model/i.test(detail))) continue;
-    return res.status(r.status === 429 || r.status === 529 ? 429 : 502).json({ error: 'upstream', status: r.status, detail: detail.slice(0, 200) });
-  }
-  return res.status(502).json({ error: 'no_model' });
+  const r = await askJSON(key, prompt, 3500, 90000);
+  if (r.ok) return res.status(200).json(r.value);
+  return res.status(r.status).json({ error: r.error, detail: r.detail });
 };
 
 module.exports.buildPrompt = buildPrompt;
